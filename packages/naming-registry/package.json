@@ -1,0 +1,20 @@
+{
+  "name": "mikey-naming-registry",
+  "version": "1.0.0",
+  "description": "Canonical naming registry and linter for Mikey's MCP tools",
+  "main": "lint.js",
+  "bin": {
+    "mikey-lint": "./lint.js"
+  },
+  "scripts": {
+    "lint": "node lint.js --scan-all",
+    "lint:verbose": "node lint.js --scan-all --verbose",
+    "report": "node lint.js --report",
+    "lint:brain": "node lint.js /Users/bard/Code/claude-brain",
+    "lint:manager": "node lint.js /Users/bard/Code/mcp-brain-manager",
+    "lint:protocols": "node lint.js /Users/bard/Code/mcp-protocols"
+  },
+  "keywords": ["mcp", "linter", "naming", "registry"],
+  "author": "Mikey",
+  "license": "MIT"
+}

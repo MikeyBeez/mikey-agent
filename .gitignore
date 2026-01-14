@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+*.bak
+
+# Keep data directory structure but not contents
+packages/protocols/data/*.json
+!packages/protocols/data/.gitkeep

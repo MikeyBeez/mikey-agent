@@ -1,0 +1,174 @@
+{
+  "$schema": "./registry-schema.json",
+  "version": "1.0.0",
+  "lastUpdated": "2026-01-13",
+  "description": "Canonical naming registry for Mikey's MCP tools and protocols",
+  "namingConventions": {
+    "toolPrefix": "mikey_",
+    "serverPrefix": "mikey-",
+    "protocolPrefix": "mikey_protocol_",
+    "reservedPrefixes": ["brain_", "state_", "manager_", "protocol_"],
+    "notes": "All custom tools must use mikey_ prefix to avoid collision with Anthropic built-ins"
+  },
+  "servers": {
+    "mikey-brain": {
+      "path": "/Users/bard/Code/claude-brain/index.js",
+      "description": "Core brain system - memory, state, execution, Obsidian integration",
+      "tools": [
+        "mikey_init",
+        "mikey_remember",
+        "mikey_recall",
+        "mikey_status",
+        "mikey_execute",
+        "mikey_state_set",
+        "mikey_state_get",
+        "mikey_state_list",
+        "mikey_state_delete",
+        "mikey_state_clear",
+        "mikey_state_transaction",
+        "mikey_state_migrate",
+        "mikey_obsidian_note",
+        "mikey_search",
+        "mikey_analyze",
+        "mikey_help",
+        "mikey_forget",
+        "mikey_pin",
+        "mikey_recent",
+        "mikey_stats",
+        "mikey_reflect",
+        "mikey_propose",
+        "mikey_review_proposals",
+        "mikey_apply_proposal",
+        "mikey_reflections",
+        "mikey_graduation_track",
+        "mikey_graduation_status",
+        "mikey_trigger_analyze",
+        "mikey_trigger_suggest",
+        "mikey_init_v5",
+        "mikey_init_v5_status",
+        "mikey_init_v5_working"
+      ]
+    },
+    "mikey-manager": {
+      "path": "/Users/bard/Code/mcp-brain-manager/dist/index.js",
+      "description": "Project management, reminders, workflows, dashboards",
+      "tools": [
+        "mikey_manager_init",
+        "mikey_semantic_classify",
+        "mikey_propose_update",
+        "mikey_confirm_update",
+        "mikey_switch_project",
+        "mikey_return_to_previous",
+        "mikey_generate_dashboard",
+        "mikey_analyze_patterns",
+        "mikey_get_context_summary",
+        "mikey_update_repository",
+        "mikey_generate_summary",
+        "mikey_handle_workflow",
+        "mikey_create_project",
+        "mikey_create_research_project",
+        "mikey_analyze_context_window",
+        "mikey_manager_help",
+        "mikey_remind_me",
+        "mikey_check_reminders",
+        "mikey_complete_reminder",
+        "mikey_archive_reminder",
+        "mikey_move_reminder_to_notes",
+        "mikey_reminder_stats",
+        "mikey_cleanup_reminders",
+        "mikey_project_status",
+        "mikey_switch_project_mode",
+        "mikey_update_background",
+        "mikey_list_active_projects",
+        "mikey_promote_to_foreground",
+        "mikey_demote_to_background"
+      ]
+    },
+    "mikey-protocols": {
+      "path": "/Users/bard/Code/mcp-protocols/src/index.js",
+      "description": "Protocol management and retrieval",
+      "tools": [
+        "mikey_protocol_list",
+        "mikey_protocol_read",
+        "mikey_protocol_search",
+        "mikey_protocol_index",
+        "mikey_protocol_backup",
+        "mikey_protocol_triggers",
+        "mikey_protocol_help",
+        "mikey_protocol_check_immutable",
+        "mikey_protocol_chunk_start",
+        "mikey_protocol_chunk_next",
+        "mikey_protocol_chunk_status",
+        "mikey_protocol_chunk_abort"
+      ]
+    }
+  },
+  "thirdPartyServers": {
+    "filesystem": {
+      "note": "Official MCP server - no renaming needed",
+      "tools": ["read_file", "write_file", "list_directory", "etc"]
+    },
+    "filesystem-enhanced": {
+      "note": "Custom but uses descriptive names unlikely to collide",
+      "tools": ["read_file", "write_file", "edit_file", "etc"]
+    }
+  },
+  "collisionRisks": {
+    "high": [
+      {"pattern": "^state_", "reason": "Generic state management - conflicts with Anthropic state tools"},
+      {"pattern": "^brain_", "reason": "Generic AI term - conflicts with Anthropic internals"},
+      {"pattern": "^help$", "reason": "Universal helper command"},
+      {"pattern": "^execute$", "reason": "Generic execution - conflicts with Bash/shell tools"},
+      {"pattern": "^init$", "reason": "Generic initialization"},
+      {"pattern": "^search$", "reason": "Generic search - many tools use this"},
+      {"pattern": "^analyze$", "reason": "Generic analysis"}
+    ],
+    "medium": [
+      {"pattern": "^manager_", "reason": "Generic management prefix"},
+      {"pattern": "^protocol_", "reason": "Could conflict with MCP protocol tools"},
+      {"pattern": "^remind", "reason": "Could conflict with reminder apps"}
+    ]
+  },
+  "ignorePatterns": {
+    "files": [
+      "*-fixed.js",
+      "*_update.js",
+      "update-*.js",
+      "*-enhanced.js",
+      "*_fixed.js",
+      "backup-*.js",
+      "*.backup.js"
+    ],
+    "directories": [
+      "node_modules",
+      "dist",
+      ".git",
+      "backup",
+      "old"
+    ],
+    "note": "These patterns match backup/update files that may have old names but aren't used"
+  },
+  "linterRules": {
+    "requireMikeyPrefix": {
+      "enabled": true,
+      "severity": "error",
+      "message": "All custom tools must start with 'mikey_' prefix"
+    },
+    "noReservedPrefixes": {
+      "enabled": true,
+      "severity": "error",
+      "message": "Cannot use reserved prefixes: brain_, state_, manager_, protocol_"
+    },
+    "noGenericNames": {
+      "enabled": true,
+      "severity": "warning",
+      "patterns": ["^help$", "^init$", "^search$", "^execute$", "^analyze$"],
+      "message": "Generic tool names should have mikey_ prefix"
+    },
+    "consistentNaming": {
+      "enabled": true,
+      "severity": "warning",
+      "message": "Tool names should use snake_case after prefix"
+    }
+  }
+}

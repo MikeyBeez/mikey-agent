@@ -1,0 +1,25 @@
+{
+  "name": "mikey-agent",
+  "version": "1.0.0",
+  "description": "Self-improving AI agent system with operational protocols, tracking harness, and persistent memory",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "lint": "node packages/naming-registry/lint.js",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "keywords": [
+    "ai-agent",
+    "mcp",
+    "protocols",
+    "claude",
+    "self-improving"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

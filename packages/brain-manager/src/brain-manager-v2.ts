@@ -1,0 +1,1641 @@
+/**
+ * Brain Manager v2 - Works within MCP constraints
+ * Instead of calling brain tools directly, it manages context locally
+ * and provides instructions for brain tool usage
+ */
+
+import { randomUUID } from 'crypto';
+import { BrainToolInstructions, BrainToolInstruction } from './brain-instructions.js';
+import { AutomatedProjectCreator, ProjectCreationOptions } from './config/project-creator.js';
+import { SecureConfigManager, ProjectConfiguration } from './config/secure-config.js';
+import { validateForSensitiveData, sanitizeSensitiveData, createPasswordPromptConfig } from './security/validators.js';
+import { RepoUpdateProtocol, RepoUpdateOptions } from './protocols/repo-update-protocol.js';
+import { CreateProjectProtocol, CreateProjectOptions } from './protocols/create-project-protocol.js';
+// Temporarily disabled: import { PythonProjectProtocol, PythonProjectOptions, PythonProjectResult } from './protocols/python-project-protocol.js';
+import { ResearchProjectCreator, ResearchProjectOptions, ResearchProjectResult, createResearchProject } from './protocols/research-project-protocol.js';
+import { updateSystemState, StateUpdaters, getProjectCount } from './system-state-manager.js';
+import { ContextWindowAnalyzer, MercuryProtocolBridge, ConversationMessage, ContextAnalysisResult } from './mercury/index.js';
+
+export interface SessionContext {
+  timestamp: string;
+  lastProject: string;
+  lastActivity: string;
+  conversationMode: string;
+  openTasks?: string[];
+  keyDecisions?: string[];
+}
+
+export interface ProjectContext {
+  projectName: string;
+  status: string;
+  created: string;
+  lastModified: string;
+  summary: string;
+  currentFocus: string;
+  openTasks: string[];
+  completedTasks: string[];
+  keyDecisions: Decision[];
+  milestones: Milestone[];
+  keyFiles: string[];
+  dependencies?: {
+    obsidianNotes?: string[];
+    codeFiles?: string[];
+    relatedProjects?: string[];
+  };
+  metadata?: Record<string, any>;
+}
+
+export interface Decision {
+  timestamp: string;
+  decision: string;
+  rationale: string;
+  impact?: string;
+}
+
+export interface Milestone {
+  timestamp: string;
+  title: string;
+  description: string;
+  artifacts?: string[];
+}
+
+export interface UpdateProposal {
+  id: string;
+  type: string;
+  timestamp: string;
+  projectName: string;
+  changesSummary: string;
+  proposedContext: ProjectContext;
+  originalUpdates: any;
+  confirmationPrompt: string;
+}
+
+export interface InitializationResult {
+  initialized: boolean;
+  mode: string;
+  confidence: number;
+  reasoning: string;
+  instructions: BrainToolInstruction[];
+  suggestedActions: string[];
+}
+
+export class BrainManagerV2 {
+  // Local session storage (persists only during MCP server lifetime)
+  private currentProject: ProjectContext | null = null;
+  private sessionContext: SessionContext | null = null;
+  private projectStack: Array<{
+    project: ProjectContext;
+    timestamp: string;
+    mode: string;
+  }> = [];
+  private pendingUpdates: Map<string, UpdateProposal> = new Map();
+  
+  // Local cache of projects (will be synced with brain state)
+  private projectCache: Map<string, ProjectContext> = new Map();
+  private lastSessionCache: SessionContext | null = null;
+  
+  // New: Automated project creator and secure config
+  private projectCreator: AutomatedProjectCreator;
+  private secureConfig: SecureConfigManager;
+  private secureSessionToken: string | null = null;
+  private repoUpdateProtocol: RepoUpdateProtocol;
+  private createProjectProtocol: CreateProjectProtocol;
+  // Temporarily disabled: private pythonProjectProtocol: PythonProjectProtocol;
+  private githubUsername: string | null = null;
+  
+  constructor() {
+    this.projectCreator = new AutomatedProjectCreator();
+    this.secureConfig = new SecureConfigManager();
+    this.repoUpdateProtocol = new RepoUpdateProtocol();
+    this.createProjectProtocol = new CreateProjectProtocol();
+    // Temporarily disabled: this.pythonProjectProtocol = new PythonProjectProtocol();
+  }
+
+  async initialize(
+    existingSession?: SessionContext,
+    existingProject?: ProjectContext
+  ): Promise<InitializationResult> {
+    const instructions: BrainToolInstruction[] = [];
+    
+    // CRITICAL: Always check reminders first for bootstrap protocol
+    instructions.push(BrainToolInstructions.custom(
+      'brain-manager:check_reminders',
+      { priority: 'critical' },
+      '[BOOT-001] Check reminders for awakening protocol and critical instructions'
+    ));
+    
+    // Then initialize brain
+    instructions.push(BrainToolInstructions.brainInit());
+    
+    // If no existing session provided, we need to load it
+    if (!existingSession) {
+      instructions.push(
+        BrainToolInstructions.stateGet('system', 'last_session_context')
+      );
+      this.lastSessionCache = null;
+    } else {
+      this.lastSessionCache = existingSession;
+      this.sessionContext = existingSession;
+    }
+    
+    // If session has a last project and it wasn't provided, load it
+    if (existingSession?.lastProject && !existingProject) {
+      instructions.push(
+        BrainToolInstructions.stateGet('project', existingSession.lastProject)
+      );
+    } else if (existingProject) {
+      this.currentProject = existingProject;
+      this.projectCache.set(existingProject.projectName, existingProject);
+    }
+    
+    return {
+      initialized: true,
+      mode: 'pending_classification',
+      confidence: 0,
+      reasoning: 'Awaiting semantic classification of user intent',
+      instructions,
+      suggestedActions: this.getSuggestedActions('init')
+    };
+  }
+
+  loadSessionData(session: SessionContext | null, project: ProjectContext | null): void {
+    if (session) {
+      this.sessionContext = session;
+      this.lastSessionCache = session;
+    }
+    
+    if (project) {
+      this.currentProject = project;
+      this.projectCache.set(project.projectName, project);
+    }
+  }
+
+  async proposeUpdate(
+    updateType: string,
+    updates: any,
+    projectName?: string
+  ): Promise<UpdateProposal> {
+    // Validate for sensitive data
+    const validation = validateForSensitiveData(updates);
+    if (!validation.isValid) {
+      throw new Error(`Security validation failed: ${validation.errors.join('; ')}. Remove sensitive data like API keys, passwords, or tokens before storing.`);
+    }
+    
+    // Additional warning for potential sensitive data
+    if (validation.warnings.length > 0) {
+      console.warn('⚠️  Security warnings:', validation.warnings);
+    }
+
+    const project = projectName 
+      ? this.projectCache.get(projectName) || this.currentProject
+      : this.currentProject;
+    
+    if (!project) {
+      throw new Error('No project specified or loaded. Load a project first with loadSessionData()');
+    }
+
+    // Create a copy for proposed changes
+    const proposedContext = JSON.parse(JSON.stringify(project));
+    const changesMade: string[] = [];
+
+    // Apply updates based on type
+    switch (updateType) {
+      case 'progress':
+        proposedContext.lastModified = new Date().toISOString();
+        
+        if (updates.completedTasks) {
+          const completed = updates.completedTasks;
+          proposedContext.openTasks = proposedContext.openTasks.filter(
+            (task: string) => !completed.includes(task)
+          );
+          proposedContext.completedTasks.push(...completed);
+          changesMade.push(`Completed ${completed.length} tasks`);
+        }
+        
+        if (updates.newTasks) {
+          proposedContext.openTasks.push(...updates.newTasks);
+          changesMade.push(`Added ${updates.newTasks.length} new tasks`);
+        }
+        
+        if (updates.currentFocus) {
+          proposedContext.currentFocus = updates.currentFocus;
+          changesMade.push(`Changed focus to: ${updates.currentFocus}`);
+        }
+        break;
+
+      case 'decision':
+        const decision: Decision = {
+          timestamp: new Date().toISOString(),
+          decision: updates.decision,
+          rationale: updates.rationale || 'No rationale provided',
+          impact: updates.impact
+        };
+        proposedContext.keyDecisions.push(decision);
+        changesMade.push(`Recorded decision: ${decision.decision}`);
+        break;
+
+      case 'milestone':
+        const milestone: Milestone = {
+          timestamp: new Date().toISOString(),
+          title: updates.title,
+          description: updates.description || '',
+          artifacts: updates.artifacts || []
+        };
+        proposedContext.milestones.push(milestone);
+        changesMade.push(`Added milestone: ${milestone.title}`);
+        break;
+
+      case 'insight':
+        if (!proposedContext.metadata) {
+          proposedContext.metadata = {};
+        }
+        if (!proposedContext.metadata.insights) {
+          proposedContext.metadata.insights = [];
+        }
+        proposedContext.metadata.insights.push({
+          timestamp: new Date().toISOString(),
+          insight: updates.insight,
+          source: updates.source || 'observation'
+        });
+        changesMade.push(`Recorded insight: ${updates.insight}`);
+        break;
+    }
+
+    // Create confirmation prompt
+    const confirmationPrompt = this.generateConfirmationPrompt(
+      updateType,
+      changesMade,
+      proposedContext
+    );
+
+    // Create and store proposal
+    const proposal: UpdateProposal = {
+      id: randomUUID(),
+      type: updateType,
+      timestamp: new Date().toISOString(),
+      projectName: project.projectName,
+      changesSummary: changesMade.join(' | '),
+      proposedContext,
+      originalUpdates: updates,
+      confirmationPrompt
+    };
+
+    this.pendingUpdates.set(proposal.id, proposal);
+    
+    // Clean up old proposals (older than 5 minutes)
+    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+    for (const [id, prop] of this.pendingUpdates.entries()) {
+      if (new Date(prop.timestamp).getTime() < fiveMinutesAgo) {
+        this.pendingUpdates.delete(id);
+      }
+    }
+
+    return proposal;
+  }
+
+  async confirmUpdate(
+    updateId: string,
+    modifications?: any
+  ): Promise<{
+    success: boolean;
+    message: string;
+    instructions: BrainToolInstruction[];
+  }> {
+    const proposal = this.pendingUpdates.get(updateId);
+    if (!proposal) {
+      return {
+        success: false,
+        message: 'Update proposal not found or expired',
+        instructions: []
+      };
+    }
+
+    // Apply any modifications
+    let finalContext = proposal.proposedContext;
+    if (modifications) {
+      finalContext = { ...finalContext, ...modifications };
+    }
+
+    // Update local cache
+    this.projectCache.set(proposal.projectName, finalContext);
+    this.currentProject = finalContext;
+
+    // Generate instructions for persisting to brain state
+    const instructions: BrainToolInstruction[] = [];
+    
+    // Save project context
+    instructions.push(
+      BrainToolInstructions.stateSet('project', proposal.projectName, finalContext)
+    );
+
+    // Update session context
+    const sessionUpdate: SessionContext = {
+      timestamp: new Date().toISOString(),
+      lastProject: proposal.projectName,
+      lastActivity: proposal.changesSummary,
+      conversationMode: 'project_management',
+      openTasks: finalContext.openTasks.slice(0, 5), // Top 5
+      keyDecisions: finalContext.keyDecisions
+        .slice(-3)
+        .map(d => d.decision)
+    };
+
+    instructions.push(
+      BrainToolInstructions.stateSet('system', 'last_session_context', sessionUpdate)
+    );
+
+    this.sessionContext = sessionUpdate;
+
+    // Remove from pending
+    this.pendingUpdates.delete(updateId);
+
+    return {
+      success: true,
+      message: `Successfully applied ${proposal.type} update to ${proposal.projectName}`,
+      instructions
+    };
+  }
+
+  async switchProject(
+    projectName: string,
+    createIfNotExists: boolean = false,
+    template?: string,
+    existingProjectData?: ProjectContext
+  ): Promise<{
+    success: boolean;
+    project?: ProjectContext;
+    message: string;
+    instructions: BrainToolInstruction[];
+  }> {
+    const instructions: BrainToolInstruction[] = [];
+
+    // Save current project to stack if exists
+    if (this.currentProject) {
+      this.projectStack.push({
+        project: JSON.parse(JSON.stringify(this.currentProject)),
+        timestamp: new Date().toISOString(),
+        mode: this.sessionContext?.conversationMode || 'unknown'
+      });
+    }
+
+    // Check local cache first
+    let project = this.projectCache.get(projectName) || existingProjectData;
+    
+    if (!project) {
+      if (createIfNotExists) {
+        // Create new project with template
+        project = this.createProjectFromTemplate(projectName, template);
+        this.projectCache.set(projectName, project);
+        
+        // Instruction to save new project
+        instructions.push(
+          BrainToolInstructions.stateSet('project', projectName, project)
+        );
+      } else {
+        // Need to load from brain state
+        instructions.push(
+          BrainToolInstructions.stateGet('project', projectName)
+        );
+        
+        return {
+          success: false,
+          message: `Project '${projectName}' not in cache. Execute the instruction to load it.`,
+          instructions
+        };
+      }
+    }
+
+    if (project) {
+      const previousProject = this.currentProject?.projectName;
+      this.currentProject = project;
+      this.projectCache.set(projectName, project);
+      
+      // Update system state tracking
+      try {
+        await StateUpdaters.projectSwitched(
+          previousProject || 'none',
+          projectName
+        );
+      } catch (error) {
+        console.error('Failed to update system state:', error);
+      }
+      
+      // ALWAYS update last_project state when switching projects
+      instructions.push(
+        BrainToolInstructions.stateSet('project', 'last_project', {
+          name: projectName,
+          path: `/Users/bard/Code/${projectName}`,
+          status: project.status,
+          last_modified: new Date().toISOString(),
+          description: project.summary
+        })
+      );
+      
+      return {
+        success: true,
+        project,
+        message: `Switched to project: ${projectName}`,
+        instructions
+      };
+    }
+
+    return {
+      success: false,
+      message: `Project '${projectName}' not found. Set createIfNotExists=true to create it.`,
+      instructions: []
+    };
+  }
+
+  async returnToPrevious(): Promise<{
+    success: boolean;
+    project?: ProjectContext;
+    message: string;
+  }> {
+    if (this.projectStack.length === 0) {
+      return {
+        success: false,
+        message: 'No previous project in stack'
+      };
+    }
+
+    const previous = this.projectStack.pop()!;
+    this.currentProject = previous.project;
+    this.projectCache.set(previous.project.projectName, previous.project);
+
+    // Note: returnToPrevious doesn't provide instructions array, so we can't update state here
+    // This method should be enhanced to return instructions for state updates
+
+    return {
+      success: true,
+      project: previous.project,
+      message: `Returned to project: ${previous.project.projectName} (saved at ${previous.timestamp}). Note: Execute brain:state_set manually to update last_project.`
+    };
+  }
+
+  async generateDashboard(
+    projectName?: string,
+    includeAnalytics: boolean = false
+  ): Promise<{
+    dashboard: string;
+    instructions: BrainToolInstruction[];
+  }> {
+    const project = projectName 
+      ? this.projectCache.get(projectName) || this.currentProject
+      : this.currentProject;
+
+    if (!project) {
+      return {
+        dashboard: '# No Project Found\n\nPlease specify a project name or load a project first.',
+        instructions: []
+      };
+    }
+
+    let dashboard = `# ${project.projectName}
+
+> **Status:** ${project.status} | **Last Modified:** ${project.lastModified}
+
+## (list) Summary
+${project.summary}
+
+## (target) Current Focus
+${project.currentFocus}
+
+## (ok) Open Tasks (${project.openTasks.length})
+`;
+
+    if (project.openTasks.length > 0) {
+      project.openTasks.forEach(task => {
+        dashboard += `- [ ] ${task}\n`;
+      });
+    } else {
+      dashboard += '*No open tasks*\n';
+    }
+
+    dashboard += `\n## ✨ Recent Milestones\n`;
+    const recentMilestones = project.milestones.slice(-3);
+    if (recentMilestones.length > 0) {
+      recentMilestones.forEach(milestone => {
+        dashboard += `- **${milestone.title}** - ${milestone.timestamp}\n`;
+        if (milestone.description) {
+          dashboard += `  - ${milestone.description}\n`;
+        }
+      });
+    } else {
+      dashboard += '*No milestones recorded*\n';
+    }
+
+    dashboard += `\n## (tip) Key Decisions\n`;
+    const recentDecisions = project.keyDecisions.slice(-5);
+    if (recentDecisions.length > 0) {
+      recentDecisions.forEach(decision => {
+        dashboard += `- **${decision.decision}**\n`;
+        dashboard += `  - *Rationale:* ${decision.rationale}\n`;
+        if (decision.impact) {
+          dashboard += `  - *Impact:* ${decision.impact}\n`;
+        }
+      });
+    } else {
+      dashboard += '*No decisions recorded*\n';
+    }
+
+    if (includeAnalytics) {
+      dashboard += `\n## (stats) Analytics\n`;
+      const analytics = this.calculateProjectAnalytics(project);
+      dashboard += `- **Velocity:** ${analytics.tasksCompletedPerWeek} tasks/week\n`;
+      dashboard += `- **Completion Rate:** ${analytics.completionRate}%\n`;
+      dashboard += `- **Days Active:** ${analytics.daysActive}\n`;
+      dashboard += `- **Decision Frequency:** ${analytics.decisionsPerWeek} decisions/week\n`;
+    }
+
+    dashboard += `\n---\n*Dashboard generated: ${new Date().toISOString()}*`;
+
+    // Generate instruction to save to Obsidian
+    const instructions = [
+      BrainToolInstructions.obsidianNote('create', {
+        title: `${project.projectName} Dashboard`,
+        content: dashboard,
+        folder: 'Projects'
+      })
+    ];
+
+    return { dashboard, instructions };
+  }
+
+  async analyzePatterns(
+    timeframe: string,
+    focusArea?: string
+  ): Promise<any> {
+    const analysis: {
+      timeframe: string;
+      focusArea: string;
+      patterns: any[];
+      insights: string[];
+      recommendations: string[];
+    } = {
+      timeframe,
+      focusArea: focusArea || 'general',
+      patterns: [],
+      insights: [],
+      recommendations: []
+    };
+
+    if (!this.currentProject) {
+      analysis.insights.push('No active project to analyze');
+      return analysis;
+    }
+
+    // Analyze based on focus area
+    switch (focusArea) {
+      case 'productivity':
+        analysis.patterns.push({
+          type: 'task_completion',
+          observation: `Completed ${this.currentProject.completedTasks.length} tasks`,
+          trend: 'stable'
+        });
+        break;
+
+      case 'decisions':
+        analysis.patterns.push({
+          type: 'decision_making',
+          observation: `Made ${this.currentProject.keyDecisions.length} key decisions`,
+          recentDecisions: this.currentProject.keyDecisions.slice(-3)
+        });
+        break;
+
+      case 'blockers':
+        analysis.patterns.push({
+          type: 'potential_blockers',
+          observation: 'Tasks that might be blocked',
+          tasks: this.currentProject.openTasks.slice(0, 3)
+        });
+        break;
+    }
+
+    return analysis;
+  }
+
+  async getContextSummary(verbose: boolean = false): Promise<any> {
+    const summary: any = {
+      initialized: true,
+      currentProject: this.currentProject ? {
+        name: this.currentProject.projectName,
+        status: this.currentProject.status,
+        focus: this.currentProject.currentFocus,
+        openTaskCount: this.currentProject.openTasks.length
+      } : null,
+      stackDepth: this.projectStack.length,
+      pendingUpdates: this.pendingUpdates.size,
+      cachedProjects: Array.from(this.projectCache.keys())
+    };
+
+    if (verbose && this.currentProject) {
+      summary.currentProject.recentActivity = {
+        lastModified: this.currentProject.lastModified,
+        recentDecisions: this.currentProject.keyDecisions.slice(-2),
+        nextTasks: this.currentProject.openTasks.slice(0, 3)
+      };
+      summary.availableActions = this.getSuggestedActions('current');
+    }
+
+    return summary;
+  }
+
+  getSuggestedActions(mode: string): string[] {
+    const actions = [];
+    
+    if (this.currentProject) {
+      actions.push('propose_update - Record progress or decisions');
+      actions.push('generate_dashboard - Create project dashboard');
+      actions.push('analyze_patterns - Analyze work patterns');
+    }
+    
+    actions.push('switch_project - Work on different project');
+    
+    if (this.projectStack.length > 0) {
+      actions.push('return_to_previous - Go back to previous project');
+    }
+    
+    return actions;
+  }
+
+  private generateConfirmationPrompt(
+    updateType: string,
+    changes: string[],
+    context: ProjectContext
+  ): string {
+    let prompt = `(note) Proposed ${updateType} update for '${context.projectName}':\n\n`;
+    
+    changes.forEach(change => {
+      prompt += `  • ${change}\n`;
+    });
+    
+    prompt += '\nConfirm these changes?';
+    return prompt;
+  }
+
+  private createProjectFromTemplate(projectName: string, template?: string): ProjectContext {
+    const now = new Date().toISOString();
+    
+    const baseProject: ProjectContext = {
+      projectName,
+      status: 'active',
+      created: now,
+      lastModified: now,
+      summary: '',
+      currentFocus: '',
+      openTasks: [],
+      completedTasks: [],
+      keyDecisions: [],
+      milestones: [],
+      keyFiles: []
+    };
+
+    // Apply template-specific fields
+    switch (template) {
+      case 'software':
+        baseProject.summary = 'Software development project';
+        baseProject.metadata = {
+          techStack: [],
+          architecture: { type: '', components: [] },
+          testingStrategy: ''
+        };
+        break;
+
+      case 'research':
+        baseProject.summary = 'Research project';
+        baseProject.metadata = {
+          researchQuestions: [],
+          hypotheses: [],
+          methodology: '',
+          dataSources: []
+        };
+        break;
+
+      case 'ml':
+        baseProject.summary = 'Machine learning project';
+        baseProject.metadata = {
+          problemType: '',
+          datasets: [],
+          models: [],
+          metrics: {}
+        };
+        break;
+
+      case 'writing':
+        baseProject.summary = 'Writing project';
+        baseProject.metadata = {
+          type: '',
+          outline: [],
+          wordCount: 0,
+          targetAudience: ''
+        };
+        break;
+    }
+
+    return baseProject;
+  }
+
+  private calculateProjectAnalytics(project: ProjectContext): any {
+    const created = new Date(project.created);
+    const now = new Date();
+    const daysActive = Math.floor((now.getTime() - created.getTime()) / (1000 * 60 * 60 * 24));
+    const weeksActive = Math.max(1, daysActive / 7);
+
+    return {
+      daysActive,
+      tasksCompletedPerWeek: Math.round(project.completedTasks.length / weeksActive),
+      completionRate: project.openTasks.length + project.completedTasks.length > 0
+        ? Math.round((project.completedTasks.length / (project.openTasks.length + project.completedTasks.length)) * 100)
+        : 0,
+      decisionsPerWeek: Math.round(project.keyDecisions.length / weeksActive)
+    };
+  }
+  
+  /**
+   * Start a secure session for accessing sensitive configuration
+   */
+  async startSecureSession(password: string): Promise<{
+    success: boolean;
+    message: string;
+    expiresAt?: Date;
+  }> {
+    const result = await this.secureConfig.startSecureSession(password);
+    
+    if (result.success && result.token) {
+      this.secureSessionToken = result.token;
+    }
+    
+    return {
+      success: result.success,
+      message: result.message,
+      expiresAt: result.expiresAt
+    };
+  }
+  
+  /**
+   * Create a new project with full automation
+   */
+  async createNewProject(
+    projectName: string,
+    options?: {
+      type?: string;
+      description?: string;
+      template?: string;
+    },
+    existingConfig?: ProjectConfiguration
+  ): Promise<{
+    success: boolean;
+    message: string;
+    instructions: BrainToolInstruction[];
+    projectInfo?: {
+      path: string;
+      githubUrl?: string;
+    };
+  }> {
+    const projectOptions: ProjectCreationOptions = {
+      name: projectName,
+      type: options?.type,
+      description: options?.description,
+      template: options?.template
+    };
+    
+    const result = await this.projectCreator.createProject(
+      projectOptions,
+      this.secureSessionToken || undefined,
+      existingConfig
+    );
+    
+    if (result.success) {
+      // Create a project context for the new project
+      const newProject: ProjectContext = {
+        projectName: projectName,
+        status: 'active',
+        created: new Date().toISOString(),
+        lastModified: new Date().toISOString(),
+        summary: options?.description || `${options?.type || 'Python'} project created with automated setup`,
+        currentFocus: 'Initial development',
+        openTasks: [
+          'Complete initial implementation',
+          'Write comprehensive tests',
+          'Create documentation',
+          'Set up deployment pipeline'
+        ],
+        completedTasks: [
+          'Project structure created',
+          'Development environment configured',
+          'Git repository initialized',
+          'CI/CD pipeline set up'
+        ],
+        keyDecisions: [],
+        milestones: [
+          {
+            timestamp: new Date().toISOString(),
+            title: 'Project Created',
+            description: 'Automated project setup completed',
+            artifacts: ['README.md', 'pyproject.toml', '.github/workflows/ci.yml']
+          }
+        ],
+        keyFiles: [
+          `${result.projectPath}/README.md`,
+          `${result.projectPath}/pyproject.toml`,
+          `${result.projectPath}/src/${projectName.replace(/-/g, '_')}/main.py`
+        ],
+        metadata: {
+          createdBy: 'automated-project-creator',
+          githubUrl: result.githubUrl,
+          projectPath: result.projectPath
+        }
+      };
+      
+      this.projectCache.set(projectName, newProject);
+      this.currentProject = newProject;
+      
+      // Update last_project state to track current project
+      result.instructions.push({
+        tool: 'brain:state_set',
+        args: {
+          category: 'project',
+          key: 'last_project',
+          value: {
+            name: projectName,
+            path: result.projectPath,
+            status: 'active',
+            last_modified: new Date().toISOString(),
+            description: newProject.summary
+          }
+        },
+        description: 'Update last_project tracker'
+      });
+    }
+    
+    return {
+      success: result.success,
+      message: result.message,
+      instructions: result.instructions,
+      projectInfo: result.success ? {
+        path: result.projectPath,
+        githubUrl: result.githubUrl
+      } : undefined
+    };
+  }
+  
+  /**
+   * Initialize with encryption support (future Monitex integration)
+   */
+  async initializeWithEncryption(
+    message: string,
+    encrypted: boolean = false
+  ): Promise<InitializationResult & { passwordPrompt?: any }> {
+    const result = await this.initialize();
+    
+    if (encrypted) {
+      // Future: This will trigger Monitex password prompt
+      const passwordConfig = createPasswordPromptConfig('access encrypted project data');
+      
+      return {
+        ...result,
+        passwordPrompt: {
+          required: true,
+          config: passwordConfig,
+          instructions: [
+            ...result.instructions,
+            {
+              tool: 'monitex',
+              action: 'prompt_password',
+              params: passwordConfig,
+              description: 'Monitex will prompt for password to decrypt state'
+            }
+          ]
+        }
+      };
+    }
+    
+    return result;
+  }
+
+  /**
+   * Get security status and recommendations
+   */
+  getSecurityStatus(): {
+    hasEncryption: boolean;
+    recommendations: string[];
+    sensitiveDataPolicy: string;
+  } {
+    return {
+      hasEncryption: false, // Will be true when Monitex integration is complete
+      recommendations: [
+        'Store API keys in environment variables',
+        'Use .env files for local development (not tracked in git)',
+        'Never commit credentials to version control',
+        'Use Monitex password prompts for sensitive operations'
+      ],
+      sensitiveDataPolicy: 'The brain state table should never contain API keys, passwords, tokens, or other authentication credentials.'
+    };
+  }
+
+  /**
+   * Execute repository update protocol
+   * Triggered by "update repo" or similar commands
+   */
+  async updateRepository(
+    commitMessage?: string,
+    options?: Partial<RepoUpdateOptions>
+  ): Promise<{
+    success: boolean;
+    summary: string;
+    instructions: BrainToolInstruction[];
+  }> {
+    if (!this.currentProject) {
+      throw new Error('No project loaded. Load a project first.');
+    }
+
+    const updateOptions: RepoUpdateOptions = {
+      projectName: this.currentProject.projectName,
+      commitMessage: commitMessage || `Update ${this.currentProject.projectName}`,
+      includeTests: true,
+      createSummary: true,
+      ...options
+    };
+
+    const result = await this.repoUpdateProtocol.executeUpdate(updateOptions);
+
+    // Update system state tracking
+    if (result.success) {
+      try {
+        await StateUpdaters.repositoryUpdated(
+          this.currentProject.projectName,
+          undefined, // commitHash - could be extracted from result if available
+          [] // changes - could be extracted from result if available
+        );
+      } catch (error) {
+        console.error('Failed to update system state:', error);
+      }
+    }
+
+    // Update last_project state to reflect recent activity
+    if (result.success) {
+      result.instructions.push({
+        tool: 'brain:state_set',
+        args: {
+          category: 'project',
+          key: 'last_project',
+          value: {
+            name: this.currentProject.projectName,
+            path: `/Users/bard/Code/${this.currentProject.projectName}`,
+            status: this.currentProject.status,
+            last_modified: new Date().toISOString(),
+            description: this.currentProject.summary
+          }
+        },
+        description: 'Update last_project tracker after repository update'
+      });
+    }
+
+    // Generate summary text
+    const summary = `
+## Repository Update ${result.success ? 'Complete' : 'Failed'} 🎉
+
+### Steps Executed:
+${result.steps.map(s => `- ${s.step}: ${s.status}`).join('\n')}
+
+### Summary:
+- Build Status: ${result.summary.buildStatus}
+- Tests Run: ${result.summary.testsRun ? 'Yes' : 'No'}
+- Documentation Updated: ${result.summary.documentationUpdated ? 'Yes' : 'No'}
+- Brain State Updated: ${result.summary.brainStateUpdated ? 'Yes' : 'No'}
+
+### Instructions:
+Execute the following commands and brain tool calls as provided.
+`;
+
+    return {
+      success: result.success,
+      summary,
+      instructions: result.instructions
+    };
+  }
+
+  /**
+   * Generate a project summary
+   * Triggered by "summarize" or similar commands
+   */
+  async generateProjectSummary(
+    changes?: string[],
+    notes?: string[]
+  ): Promise<{
+    success: boolean;
+    instructions: BrainToolInstruction[];
+  }> {
+    if (!this.currentProject) {
+      throw new Error('No project loaded.');
+    }
+
+    const defaultChanges = [
+      `Worked on ${this.currentProject.projectName}`,
+      `Current focus: ${this.currentProject.currentFocus}`,
+      `Open tasks: ${this.currentProject.openTasks.length}`,
+      `Completed tasks: ${this.currentProject.completedTasks.length}`
+    ];
+
+    const instructions = this.repoUpdateProtocol.generateSummaryOnly(
+      this.currentProject.projectName,
+      changes || defaultChanges,
+      notes
+    );
+
+    return {
+      success: true,
+      instructions
+    };
+  }
+
+  /**
+   * Handle common workflow commands
+   * Maps natural language to appropriate actions
+   */
+  async handleWorkflowCommand(
+    command: string
+  ): Promise<{
+    action: string;
+    result: any;
+    instructions: BrainToolInstruction[];
+  }> {
+    const lowerCommand = command.toLowerCase();
+
+    // Repository update triggers
+    if (lowerCommand.includes('update repo') || 
+        lowerCommand.includes('commit') ||
+        lowerCommand.includes('push changes')) {
+      const result = await this.updateRepository();
+      return {
+        action: 'repository_update',
+        result,
+        instructions: result.instructions
+      };
+    }
+
+    // Summary triggers
+    if (lowerCommand.includes('summarize') ||
+        lowerCommand.includes('summary') ||
+        lowerCommand.includes('recap')) {
+      const result = await this.generateProjectSummary();
+      return {
+        action: 'generate_summary',
+        result,
+        instructions: result.instructions
+      };
+    }
+
+    // Project switching
+    if (lowerCommand.includes('switch to') ||
+        lowerCommand.includes('open project')) {
+      // Extract project name from command
+      const projectMatch = command.match(/(?:switch to|open project)\s+([\w-]+)/i);
+      if (projectMatch) {
+        const result = await this.switchProject(projectMatch[1]);
+        return {
+          action: 'switch_project',
+          result,
+          instructions: result.instructions
+        };
+      }
+    }
+
+    // Project creation - Planning phase
+    if (lowerCommand.includes('create project') ||
+        lowerCommand.includes('new project') ||
+        lowerCommand.includes('make project') ||
+        lowerCommand.includes('set up project')) {
+      // Extract project name from command
+      const projectMatch = command.match(/(?:create|new|make|set up)\s+(?:project\s+)?([\w-]+)/i);
+      if (projectMatch) {
+        const projectName = projectMatch[1];
+        // Return planning phase instead of immediate execution
+        const planResult = await this.planProjectCreation(projectName, command);
+        return {
+          action: 'plan_project',
+          result: planResult,
+          instructions: []
+        };
+      }
+    }
+
+    // Project creation execution (after planning)
+    if (lowerCommand.includes('proceed with') && 
+        (lowerCommand.includes('project') || lowerCommand.includes('creation'))) {
+      // Extract project name from pending plans
+      for (const [key, plan] of this.pendingUpdates.entries()) {
+        if (key.startsWith('project-plan-') && plan.type === 'project-planning') {
+          // Found a pending project plan
+          const projectName = plan.projectName;
+          
+          // Parse any modifications from the command
+          let projectType = (plan.originalUpdates as any).suggestedType;
+          let visibility: 'public' | 'private' = 'public';
+          let description = '';
+          
+          // Check for type override
+          if (lowerCommand.includes('as mcp')) projectType = 'mcp-tool';
+          else if (lowerCommand.includes('as cli')) projectType = 'cli-tool';
+          else if (lowerCommand.includes('as web')) projectType = 'web-app';
+          else if (lowerCommand.includes('as api')) projectType = 'api';
+          else if (lowerCommand.includes('as library')) projectType = 'library';
+          
+          // Check for visibility
+          if (lowerCommand.includes('private')) visibility = 'private';
+          
+          // Remove from pending and execute
+          this.pendingUpdates.delete(key);
+          
+          const result = await this.createProject({
+            projectName,
+            projectType,
+            description,
+            visibility,
+            language: 'typescript',
+            features: {
+              typescript: true,
+              testing: true,
+              linting: true,
+              cicd: true,
+              vscode: true
+            }
+          });
+          
+          return {
+            action: 'create_project',
+            result,
+            instructions: result.instructions
+          };
+        }
+      }
+      
+      throw new Error('No pending project creation found. Use "create project [name]" first.');
+    }
+
+    throw new Error(`Unknown workflow command: ${command}`);
+  }
+
+  async planProjectCreation(
+    projectName: string,
+    originalCommand: string
+  ): Promise<{
+    projectName: string;
+    suggestedType: string;
+    questionsToAsk: string[];
+    setupPlan: string;
+    readyToProceed: boolean;
+  }> {
+    // Try to infer project type from command
+    const lowerCommand = originalCommand.toLowerCase();
+    let suggestedType = 'general';
+    if (lowerCommand.includes('mcp')) suggestedType = 'mcp-tool';
+    else if (lowerCommand.includes('cli')) suggestedType = 'cli-tool';
+    else if (lowerCommand.includes('web')) suggestedType = 'web-app';
+    else if (lowerCommand.includes('api')) suggestedType = 'api';
+    else if (lowerCommand.includes('library') || lowerCommand.includes('lib')) suggestedType = 'library';
+
+    const questionsToAsk = [
+      `What is the main purpose of ${projectName}?`,
+      'What features or functionality should it have?',
+      'Do you have any specific dependencies or technologies in mind?',
+      'Will this be a public or private repository?',
+      'Any special requirements or integrations needed?'
+    ];
+
+    const setupPlan = `
+## Project Setup Plan: ${projectName}
+
+### Initial Assessment
+- **Project Name:** ${projectName}
+- **Suggested Type:** ${suggestedType}
+- **Default Language:** TypeScript (can be changed)
+
+### What I'll Set Up Automatically
+1. **Basic Structure:**
+   - Project directory at /Users/bard/Code/${projectName}
+   - Git repository initialization
+   - Standard directories (src, tests, docs)
+
+2. **Development Environment:**
+   - VS Code configuration
+   - TypeScript/JavaScript setup
+   - Testing framework (Jest)
+   - Linting and formatting
+
+3. **Documentation:**
+   - README with your project description
+   - License file
+   - Basic changelog
+
+4. **Integration:**
+   - Brain Manager project tracking
+   - Obsidian project notes
+
+### What I Need to Know
+${questionsToAsk.map((q, i) => `${i + 1}. ${q}`).join('\n')}
+
+### Next Steps
+Once you answer these questions, I'll:
+1. Create a customized project structure
+2. Generate appropriate starter code
+3. Set up all configurations
+4. Create and push to GitHub
+5. Provide clear instructions for getting started
+
+Would you like to proceed with ${suggestedType} as the project type, or would you prefer something different?
+`;
+
+    // Save project planning state
+    const planningState = {
+      projectName,
+      suggestedType,
+      timestamp: new Date().toISOString(),
+      status: 'planning'
+    };
+
+    // Store in session for follow-up
+    this.pendingUpdates.set(`project-plan-${projectName}`, {
+      id: `project-plan-${projectName}`,
+      type: 'project-planning',
+      timestamp: new Date().toISOString(),
+      projectName,
+      changesSummary: 'Project creation planning',
+      proposedContext: planningState as any,
+      originalUpdates: { suggestedType },
+      confirmationPrompt: setupPlan
+    });
+
+    // Also save to Brain state for persistence
+    const saveInstruction = BrainToolInstructions.stateSet(
+      'session',
+      `project-plan-${projectName}`,
+      {
+        projectName,
+        suggestedType,
+        timestamp: new Date().toISOString(),
+        status: 'planning',
+        questionsToAsk
+      }
+    );
+
+    return {
+      projectName,
+      suggestedType,
+      questionsToAsk,
+      setupPlan,
+      readyToProceed: false
+    };
+  }
+
+  async createProject(
+    options: CreateProjectOptions
+  ): Promise<{
+    success: boolean;
+    projectPath: string;
+    summary: string;
+    instructions: BrainToolInstruction[];
+    nextSteps: string[];
+  }> {
+    // Set GitHub username if available
+    if (this.githubUsername) {
+      this.createProjectProtocol.setGitHubUsername(this.githubUsername);
+    }
+
+    const result = await this.createProjectProtocol.executeCreate(options);
+
+    // Create project context and set as current
+    if (result.success) {
+      const newProject: ProjectContext = {
+        projectName: options.projectName,
+        status: 'active',
+        created: new Date().toISOString(),
+        lastModified: new Date().toISOString(),
+        summary: options.description || `${options.projectType} project created`,
+        currentFocus: 'Initial development',
+        openTasks: ['Complete initial implementation', 'Write tests', 'Create documentation'],
+        completedTasks: ['Project structure created', 'Git repository initialized'],
+        keyDecisions: [],
+        milestones: [{
+          timestamp: new Date().toISOString(),
+          title: 'Project Created',
+          description: 'Automated project setup completed',
+          artifacts: ['README.md']
+        }],
+        keyFiles: [`${result.projectPath}/README.md`],
+        metadata: {
+          createdBy: 'brain-manager',
+          projectPath: result.projectPath
+        }
+      };
+      
+      this.projectCache.set(options.projectName, newProject);
+      this.currentProject = newProject;
+      
+      // Update system state tracking
+      try {
+        await StateUpdaters.projectCreated(
+          options.projectName,
+          options.projectType || 'general',
+          result.projectPath
+        );
+      } catch (error) {
+        console.error('Failed to update system state:', error);
+      }
+      
+      // Update last_project state to track current project
+      result.instructions.push({
+        tool: 'brain:state_set',
+        args: {
+          category: 'project',
+          key: 'last_project',
+          value: {
+            name: options.projectName,
+            path: result.projectPath,
+            status: 'active',
+            last_modified: new Date().toISOString(),
+            description: newProject.summary
+          }
+        },
+        description: 'Update last_project tracker'
+      });
+    }
+
+    // Format summary for display
+    const summary = `
+## Project Created Successfully! 🎉
+
+### Project Details:
+- **Name:** ${result.summary.projectName}
+- **Type:** ${result.summary.projectType}
+- **Location:** ${result.summary.location}
+${result.summary.githubRepo ? `- **Repository:** ${result.summary.githubRepo}` : ''}
+
+### Setup Complete:
+${result.summary.gitInitialized ? '(ok)' : '(error)'} Git initialized
+${result.summary.testsCreated ? '(ok)' : '(error)'} Tests created
+${result.summary.documentationCreated ? '(ok)' : '(error)'} Documentation created
+${result.summary.dependenciesInstalled ? '(ok)' : '(error)'} Dependencies installed
+${result.summary.brainIntegrated ? '(ok)' : '(error)'} Brain integration
+
+### Next Steps:
+${result.nextSteps.map((step: string) => `- ${step}`).join('\n')}
+`;
+
+    return {
+      success: result.success,
+      projectPath: result.projectPath,
+      summary,
+      instructions: result.instructions,
+      nextSteps: result.nextSteps
+    };
+  }
+
+  /**
+   * Create a new Python project with full automation
+   */
+// TEMP DISABLED:   async createPythonProject(
+// TEMP DISABLED:     options: PythonProjectOptions
+// TEMP DISABLED:   ): Promise<{
+// TEMP DISABLED:     success: boolean;
+// TEMP DISABLED:     projectPath: string;
+// TEMP DISABLED:     summary: string;
+// TEMP DISABLED:     instructions: BrainToolInstruction[];
+// TEMP DISABLED:     nextSteps: string[];
+// TEMP DISABLED:   }> {
+// TEMP DISABLED:     // Set GitHub username if available
+// TEMP DISABLED:     if (this.githubUsername) {
+// TEMP DISABLED:       this.pythonProjectProtocol.setGitHubUsername(this.githubUsername);
+// TEMP DISABLED:     }
+// TEMP DISABLED: 
+// TEMP DISABLED:     const result = await this.pythonProjectProtocol.executeCreate(options);
+// TEMP DISABLED: 
+// TEMP DISABLED:     // Create project context and set as current
+// TEMP DISABLED:     if (result.success) {
+// TEMP DISABLED:       const newProject: ProjectContext = {
+// TEMP DISABLED:         projectName: options.projectName,
+// TEMP DISABLED:         status: 'active',
+// TEMP DISABLED:         created: new Date().toISOString(),
+// TEMP DISABLED:         lastModified: new Date().toISOString(),
+// TEMP DISABLED:         summary: options.description || `Python ${options.projectType} project created`,
+// TEMP DISABLED:         currentFocus: 'Initial development',
+// TEMP DISABLED:         openTasks: ['Complete initial implementation', 'Write comprehensive tests', 'Add error handling'],
+// TEMP DISABLED:         completedTasks: ['Project structure created', 'Virtual environment set up', 'Git repository initialized'],
+// TEMP DISABLED:         keyDecisions: [],
+// TEMP DISABLED:         milestones: [{
+// TEMP DISABLED:           timestamp: new Date().toISOString(),
+// TEMP DISABLED:           title: 'Python Project Created',
+// TEMP DISABLED:           description: 'Automated Python project setup completed',
+// TEMP DISABLED:           artifacts: ['pyproject.toml', 'README.md']
+// TEMP DISABLED:         }],
+// TEMP DISABLED:         keyFiles: [`${result.projectPath}/pyproject.toml`, `${result.projectPath}/README.md`],
+// TEMP DISABLED:         metadata: {
+// TEMP DISABLED:           createdBy: 'brain-manager-python',
+// TEMP DISABLED:           projectPath: result.projectPath,
+// TEMP DISABLED:           language: 'python',
+// TEMP DISABLED:           packageManager: options.packageManager || 'uv',
+// TEMP DISABLED:           pythonVersion: options.pythonVersion || '3.11'
+// TEMP DISABLED:         }
+// TEMP DISABLED:       };
+// TEMP DISABLED:       
+// TEMP DISABLED:       this.projectCache.set(options.projectName, newProject);
+// TEMP DISABLED:       this.currentProject = newProject;
+// TEMP DISABLED:       
+// TEMP DISABLED:       // Update last_project state to track current project
+// TEMP DISABLED:       result.instructions.push({
+// TEMP DISABLED:         tool: 'brain:state_set',
+// TEMP DISABLED:         args: {
+// TEMP DISABLED:           category: 'project',
+// TEMP DISABLED:           key: 'last_project',
+// TEMP DISABLED:           value: {
+// TEMP DISABLED:             name: options.projectName,
+// TEMP DISABLED:             path: result.projectPath,
+// TEMP DISABLED:             status: 'active',
+// TEMP DISABLED:             last_modified: new Date().toISOString(),
+// TEMP DISABLED:             description: newProject.summary
+// TEMP DISABLED:           }
+// TEMP DISABLED:         },
+// TEMP DISABLED:         description: 'Update last_project tracker'
+// TEMP DISABLED:       });
+// TEMP DISABLED:     }
+// TEMP DISABLED: 
+// TEMP DISABLED:     // Format summary for display
+// TEMP DISABLED:     const summary = `
+// TEMP DISABLED: ## Python Project Created Successfully! 🐍🎉
+// TEMP DISABLED: 
+// TEMP DISABLED: ### Project Details:
+// TEMP DISABLED: - **Name:** ${result.summary.projectName}
+// TEMP DISABLED: - **Type:** ${result.summary.projectType}
+// TEMP DISABLED: - **Location:** ${result.summary.location}
+// TEMP DISABLED: - **Python Version:** ${result.summary.pythonVersion}
+// TEMP DISABLED: - **Package Manager:** ${result.summary.packageManager}
+// TEMP DISABLED: ${result.summary.githubRepo ? `- **Repository:** ${result.summary.githubRepo}` : ''}
+// TEMP DISABLED: 
+// TEMP DISABLED: ### Setup Complete:
+// TEMP DISABLED: ${result.summary.gitInitialized ? '(ok)' : '(error)'} Git initialized
+// TEMP DISABLED: ${result.summary.virtualEnvCreated ? '(ok)' : '(error)'} Virtual environment created
+// TEMP DISABLED: ${result.summary.testsCreated ? '(ok)' : '(error)'} Tests created
+// TEMP DISABLED: ${result.summary.documentationCreated ? '(ok)' : '(error)'} Documentation created
+// TEMP DISABLED: ${result.summary.dependenciesInstalled ? '(ok)' : '(error)'} Dependencies installed
+// TEMP DISABLED: ${result.summary.brainIntegrated ? '(ok)' : '(error)'} Brain integration
+// TEMP DISABLED: 
+// TEMP DISABLED: ### Next Steps:
+// TEMP DISABLED: ${result.nextSteps.map((step: string) => `- ${step}`).join('\n')}
+// TEMP DISABLED: `;
+// TEMP DISABLED: 
+// TEMP DISABLED:     return {
+// TEMP DISABLED:       success: result.success,
+// TEMP DISABLED:       projectPath: result.projectPath,
+// TEMP DISABLED:       summary,
+// TEMP DISABLED:       instructions: result.instructions,
+// TEMP DISABLED:       nextSteps: result.nextSteps
+// TEMP DISABLED:     };
+// TEMP DISABLED:   }
+// TEMP DISABLED: 
+// TEMP DISABLED:   /**
+// TEMP DISABLED:    * Create a research project with proper structure and Brain integration
+// TEMP DISABLED:    */
+  async createResearchProject(options: ResearchProjectOptions): Promise<{
+    success: boolean;
+    projectPath: string;
+    summary: string;
+    instructions: BrainToolInstruction[];
+    nextSteps: string[];
+  }> {
+    const result = await createResearchProject(options);
+
+    // Create project context and set as current
+    if (result.success) {
+      const newProject: ProjectContext = {
+        projectName: options.projectName,
+        status: 'active',
+        created: new Date().toISOString(),
+        lastModified: new Date().toISOString(),
+        summary: options.description,
+        currentFocus: 'Research methodology and planning',
+        openTasks: ['Define research methodology', 'Create investigation plan', 'Begin Phase 1'],
+        completedTasks: ['Research project structure created', 'Templates set up'],
+        keyDecisions: [{
+          timestamp: new Date().toISOString(),
+          decision: `Use ${options.researchType} research approach`,
+          rationale: options.methodology || 'Systematic research methodology',
+          impact: 'Establishes foundation for rigorous investigation'
+        }],
+        milestones: [{
+          timestamp: new Date().toISOString(),
+          title: 'Research Project Created',
+          description: 'Research project structure and methodology established',
+          artifacts: ['00-project-overview.md', 'methodology/', 'templates/']
+        }],
+        keyFiles: [
+          `${result.projectPath}/00-project-overview.md`,
+          `${result.projectPath}/methodology/01-research-methodology.md`,
+          `${result.projectPath}/findings/session-tracking.md`
+        ],
+        metadata: {
+          createdBy: 'brain-manager-research',
+          projectPath: result.projectPath,
+          projectType: 'research',
+          researchType: options.researchType,
+          methodology: options.methodology,
+          timeframe: options.timeframe,
+          phases: options.phases,
+          deliverables: options.deliverables
+        }
+      };
+      
+      this.projectCache.set(options.projectName, newProject);
+      this.currentProject = newProject;
+    }
+
+    // Format summary for display
+    const summary = `
+## Research Project Created Successfully! 🔬(list)
+
+### Project Details:
+- **Name:** ${options.projectName}
+- **Type:** ${options.researchType} research
+- **Location:** ${result.projectPath}
+- **Methodology:** ${options.methodology || 'To be defined'}
+- **Timeframe:** ${options.timeframe || 'To be planned'}
+- **Phases:** ${options.phases?.length || 0}
+- **Deliverables:** ${options.deliverables?.length || 0}
+
+### Structure Created:
+(ok) Project overview and methodology
+(ok) Investigation planning templates
+(ok) Session tracking system
+(ok) Evidence documentation structure
+(ok) Progress monitoring system
+(ok) Brain state integration
+(ok) Obsidian note structure
+
+### Next Steps:
+${result.nextSteps.map((step: string) => `- ${step}`).join('\n')}
+`;
+
+    return {
+      success: result.success,
+      projectPath: result.projectPath,
+      summary,
+      instructions: result.brainInstructions,
+      nextSteps: result.nextSteps
+    };
+  }
+
+  /**
+   * Get the current project context
+   */
+  getCurrentProject(): ProjectContext | null {
+    return this.currentProject;
+  }
+
+  /**
+   * Analyze context window for Mercury learning - Phase 2 Full Implementation
+   * This replaces the prototype implementation with full Mercury Protocol integration
+   */
+  async analyzeContextWindow(
+    conversationMessages: ConversationMessage[],
+    sessionId: string
+  ): Promise<ContextAnalysisResult | null> {
+    try {
+      // Initialize Mercury Protocol Bridge if not already done
+      const mercuryBridge = new MercuryProtocolBridge({
+        enableAutoAnalysis: true,
+        learningThreshold: 0.3,
+        storePatterns: true,
+        storeInsights: true
+      });
+
+      // Complete the Mercury session with analysis
+      const analysisResult = await mercuryBridge.completeSession(
+        sessionId,
+        conversationMessages,
+        {
+          // Mock brain interface for now - would be actual brain interface in production
+          brain_remember: async (key: string, value: any, type: string) => {
+            console.log(`Mercury: Storing ${type} memory:`, key);
+            return true;
+          }
+        }
+      );
+
+      if (analysisResult) {
+        console.log(`Mercury Analysis Complete:`, {
+          sessionId: analysisResult.sessionId,
+          intent: analysisResult.intent,
+          overallScore: (analysisResult.success.overallScore * 100).toFixed(1) + '%',
+          learningValue: (analysisResult.learningValue * 100).toFixed(1) + '%',
+          insights: analysisResult.insights.length,
+          patterns: analysisResult.toolPatterns.length
+        });
+      }
+
+      return analysisResult;
+      
+    } catch (error) {
+      console.error('Mercury context window analysis failed:', error);
+      return null;
+    }
+  }
+}
