@@ -1,25 +1,48 @@
 # Mikey Agent
 
-A self-improving AI agent system built on operational protocols, automatic tracking, and persistent memory.
+A self-improving AI agent system built on operational protocols, task dependencies, and persistent memory.
 
 ## What This Is
 
-This is infrastructure for building AI agents that improve through use. The core insight: agents need an intermediate layer between memory and tools — **operational protocols** that can be instrumented, measured, and evolved.
+Infrastructure for building AI agents that improve through use. The core insights:
+
+1. **Operational protocols** — behavioral scaffolds that can be instrumented, measured, and evolved
+2. **Task dependencies** — DAG-based work management with ready queues
+3. **Persistent memory** — cross-session state that survives context limits
 
 ## Architecture
 
 ```
 mikey-agent/
 ├── packages/
-│   ├── protocols/         # Protocol system with tracking harness
-│   ├── naming-registry/   # Namespace management and linting
-│   ├── brain-core/        # Persistent memory layer
-│   ├── brain-manager/     # Memory management and routing
-│   └── brain-assistant/   # Memory assistant interface
-└── package.json           # Workspace root
+│   ├── mission-control/      # Task dependency system (Python)
+│   ├── protocols/            # Protocol system with tracking harness
+│   ├── naming-registry/      # Namespace management and linting
+│   ├── brain-core/           # Persistent memory layer
+│   ├── brain-manager/        # Memory management and routing
+│   └── brain-assistant/      # Memory assistant interface
+└── package.json              # Workspace root
 ```
 
 ## Core Concepts
+
+### Mission Control (Task Dependencies)
+
+Inspired by Steve Yegge's "Beads" — a DAG-based task system where work items can have dependencies.
+
+**Key features:**
+- Tasks with hash-based IDs (`m-a1b2c3`)
+- Dependency graph with `get_ready_tasks()`
+- Circular dependency detection via DFS
+- Git-native JSONL storage in `.mikey_tasks/`
+- Auto-archive completed tasks with no dependents
+
+**MCP Tools:**
+- `mikey_create_task` — Create task with dependencies
+- `mikey_update_task_status` — Update status (todo/in_progress/blocked/done)
+- `mikey_list_ready_work` — Get tasks ready for execution
+- `mikey_check_consistency` — Verify no circular dependencies
+- `mikey_task_summary` — Mission overview
 
 ### Protocols as Scaffolds
 
@@ -44,15 +67,26 @@ The `mikey_` prefix prevents collisions with built-in tools. The naming registry
 
 ## Packages
 
+### mission-control (Python)
+
+Task dependency system with DAG-based ready queue.
+
+```bash
+cd packages/mission-control
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pydantic mcp
+pytest  # 15 tests
+```
+
 ### protocols
 
-The protocol system with 11 operational protocols:
+The protocol system with operational protocols across tiers:
 
-**Meta (Tier 1):** Protocol Selection, Protocol Lifecycle, Protocol Writing, Naming Linter, Active Inference
-
-**Foundation (Tier 2):** Error Recovery, User Communication, Task Approach, Information Integration, Progress Communication
-
-**Specialized (Tier 3):** Medium Article Writing
+**Tier 0 (Meta):** Prompt Processing, Protocol Selection
+**Tier 1 (Critical):** Active Inference, Protocol Lifecycle, Architecture Update
+**Tier 2 (Foundation):** Error Recovery, User Communication, Task Approach
+**Tier 3 (Specialized):** Medium Article Writing, Create Project
 
 ### naming-registry
 
@@ -71,6 +105,7 @@ Persistent memory system for cross-session state.
 ### Prerequisites
 
 - Node.js 18+
+- Python 3.9+ (for mission-control)
 - Claude Code or another MCP-compatible client
 
 ### Installation
@@ -78,15 +113,25 @@ Persistent memory system for cross-session state.
 ```bash
 cd mikey-agent
 npm install
+
+# For mission-control
+cd packages/mission-control
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pydantic mcp
 ```
 
 ### Running MCP Servers
 
-Each package in `packages/` is an MCP server. Configure your MCP client to point to them:
+Configure your MCP client (`~/.claude.json`):
 
 ```json
 {
   "mcpServers": {
+    "mission-control": {
+      "command": "/path/to/mikey-agent/packages/mission-control/.venv/bin/python3",
+      "args": ["/path/to/mikey-agent/packages/mission-control/src/server.py"]
+    },
     "mikey-protocols": {
       "command": "node",
       "args": ["/path/to/mikey-agent/packages/protocols/src/index.js"]
@@ -97,7 +142,7 @@ Each package in `packages/` is an MCP server. Configure your MCP client to point
 
 ## The Self-Improvement Loop
 
-1. Use protocols during normal work
+1. Use protocols and tasks during normal work
 2. Harness captures every access automatically
 3. Heat map accumulates usage patterns
 4. Graduation candidates emerge from high-use protocols
@@ -118,6 +163,7 @@ This system was built to solve real problems:
 2. **Namespace collisions** — custom tools conflicting with built-ins
 3. **Behavioral consistency** — reliable patterns for common situations
 4. **Self-observation** — knowing what actually works vs. what we think works
+5. **Task management** — tracking dependencies across complex work
 
 The agent isn't magic. It's infrastructure.
 
