@@ -94,7 +94,30 @@ Add the following to `~/.claude.json` in the `mcpServers` section:
 
 Replace `YOUR_USERNAME` with your actual username.
 
-## Step 5: Create CLAUDE.md
+## Step 5: Configure Hooks
+
+### Create hooks directory
+```bash
+mkdir -p ~/.claude/hooks ~/.claude/state
+```
+
+### Copy hook scripts
+```bash
+cp ~/Code/mikey-agent/config/hooks/* ~/.claude/hooks/
+chmod +x ~/.claude/hooks/*.sh
+```
+
+### Configure settings.json
+```bash
+cp ~/Code/mikey-agent/config/settings.json.template ~/.claude/settings.json
+```
+
+The hooks provide:
+- **UserPromptSubmit**: Protocol detection with prompt-count expiry
+- **PreToolUse**: Block `find` (use `locate`), warn on broad searches
+- **Stop**: End-of-session reminders
+
+## Step 6: Create CLAUDE.md
 
 Copy the template from this repo:
 
@@ -104,14 +127,14 @@ cp ~/Code/mikey-agent/config/CLAUDE.md.template ~/.claude/CLAUDE.md
 
 Edit to customize for your setup.
 
-## Step 6: Restart Claude Code
+## Step 7: Restart Claude Code
 
 ```bash
 # Exit any running Claude Code session
 claude
 ```
 
-## Step 7: Verify Installation
+## Step 8: Verify Installation
 
 In Claude Code, run:
 
@@ -143,6 +166,9 @@ You should see:
 | Task files | `.mikey_tasks/` in project root |
 | Session status | `~/Code/docs/session-status.md` |
 | MCP logs | `~/Library/Logs/Claude/` |
+| Hook state | `~/.claude/state/protocol-state.json` |
+| Hook scripts | `~/.claude/hooks/` |
+| Hooks config | `~/.claude/settings.json` |
 
 ## Troubleshooting
 

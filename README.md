@@ -1,6 +1,6 @@
 # Mikey Agent
 
-A self-improving AI agent system built on persistent memory, operational protocols, and task dependencies.
+A self-improving AI agent system built on persistent memory, operational protocols, task dependencies, and automatic hooks.
 
 ## Quick Start
 
@@ -14,6 +14,7 @@ Infrastructure for building AI agents that improve through use:
 2. **Operational protocols** — Behavioral scaffolds that can be instrumented and evolved
 3. **Task dependencies** — DAG-based work management with ready queues
 4. **Active inference** — Reflection and learning from outcomes
+5. **Automatic hooks** — Event-driven behaviors with prompt-count-based protocol loading
 
 ## Component Repos
 
@@ -21,7 +22,7 @@ Infrastructure for building AI agents that improve through use:
 |------|---------|-------|
 | [claude-brain](https://github.com/mikeybeez/claude-brain) | Memory, state, reflection | `mikey_init`, `mikey_remember`, `mikey_recall`, `mikey_reflect` |
 | [mcp-protocols](https://github.com/mikeybeez/mcp-protocols) | Protocol library, tracking | `mikey_protocol_*`, `mikey_prompt_process` |
-| [mikey-manager](https://github.com/mikeybeez/mikey-manager) | Projects, reminders | `mikey_remind`, `mikey_project_*` |
+| [mcp-brain-manager](https://github.com/mikeybeez/mcp-brain-manager) | Projects, reminders | `mikey_remind`, `mikey_project_*` |
 | **mikey-agent** (this repo) | Task dependencies | `mikey_create_task`, `mikey_list_ready_work` |
 
 ## Architecture
@@ -30,7 +31,16 @@ Infrastructure for building AI agents that improve through use:
 ┌─────────────────────────────────────────────────────────┐
 │                    Claude Code                          │
 ├─────────────────────────────────────────────────────────┤
-│  CLAUDE.md (instructions)                               │
+│  ~/.claude/settings.json (hooks config)                 │
+│  ~/.claude/CLAUDE.md (instructions)                     │
+├─────────────────────────────────────────────────────────┤
+│  ~/.claude/hooks/                                       │
+│  ├── prompt-submit.sh      (UserPromptSubmit)          │
+│  ├── prompt-processor.js   (protocol detection)        │
+│  ├── mark-protocol-loaded.sh                           │
+│  ├── check-find.sh         (PreToolUse: Bash)          │
+│  ├── check-search.sh       (PreToolUse: Grep)          │
+│  └── session-stop.sh       (Stop)                      │
 ├─────────────────────────────────────────────────────────┤
 │                    MCP Servers                          │
 │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐    │
@@ -42,11 +52,40 @@ Infrastructure for building AI agents that improve through use:
 │  │   (Python)   │                                       │
 │  └──────────────┘                                       │
 ├─────────────────────────────────────────────────────────┤
+│  ~/.claude/state/protocol-state.json (prompt tracking) │
 │  brain.db (SQLite)  │  .mikey_tasks/ (JSONL)           │
 └─────────────────────────────────────────────────────────┘
 ```
 
 ## Core Concepts
+
+### Hooks System
+
+Claude Code hooks provide automatic behaviors triggered by events:
+
+**UserPromptSubmit** — Runs on every user prompt:
+- Detects trigger keywords (error, project, protocol, etc.)
+- Tracks which protocols are loaded and when
+- Suggests protocol loading with expiry (reload after 10 prompts)
+- Prevents duplicate protocols in context
+
+**PreToolUse** — Runs before tool execution:
+- Blocks `find` command (enforces `locate` for performance)
+- Warns on overly broad searches
+
+**Stop** — Runs when session ends:
+- Reminds to commit tasks, reflect, update docs
+
+State is tracked in `~/.claude/state/protocol-state.json`:
+```json
+{
+  "promptCount": 42,
+  "protocols": {
+    "error-recovery": 35,
+    "create-project": 28
+  }
+}
+```
 
 ### Memory System (claude-brain)
 - **Remember**: Store facts, decisions, patterns
@@ -69,11 +108,12 @@ Infrastructure for building AI agents that improve through use:
 ## The Self-Improvement Loop
 
 1. Work using protocols and tasks
-2. Harness captures usage automatically
-3. `mikey_reflect` evaluates outcomes
-4. High-surprise outcomes trigger proposals
-5. Proposals are reviewed and applied
-6. Protocols evolve based on actual data
+2. Hooks detect relevant protocols automatically
+3. Harness captures usage patterns
+4. `mikey_reflect` evaluates outcomes
+5. High-surprise outcomes trigger proposals
+6. Proposals are reviewed and applied
+7. Protocols evolve based on actual data
 
 ## This Repo Contains
 
@@ -81,11 +121,26 @@ Infrastructure for building AI agents that improve through use:
 mikey-agent/
 ├── README.md           # This file
 ├── SETUP.md            # Installation guide
+├── docs/               # Comprehensive documentation
+│   ├── ARCHITECTURE.md # Full system architecture
+│   ├── HOOKS.md        # Hooks system guide
+│   ├── PROTOCOLS.md    # Protocol system guide
+│   └── TROUBLESHOOTING.md
 ├── config/
-│   └── CLAUDE.md.template
+│   ├── CLAUDE.md.template
+│   ├── settings.json.template
+│   └── hooks/          # Hook script templates
 └── packages/
     └── mission-control/  # Task dependency system (Python)
 ```
+
+## Documentation
+
+- [SETUP.md](SETUP.md) — Installation guide
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Full system architecture
+- [docs/HOOKS.md](docs/HOOKS.md) — Hooks system guide
+- [docs/PROTOCOLS.md](docs/PROTOCOLS.md) — Protocol system guide
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Common issues and solutions
 
 ## License
 

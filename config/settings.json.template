@@ -1,0 +1,33 @@
+{
+  "model": "opus",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "bash ~/.claude/hooks/prompt-submit.sh"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "bash ~/.claude/hooks/check-find.sh",
+        "matcher": {
+          "tool_name": "Bash"
+        }
+      },
+      {
+        "type": "command",
+        "command": "bash ~/.claude/hooks/check-search.sh",
+        "matcher": {
+          "tool_name": "Grep"
+        }
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bash ~/.claude/hooks/session-stop.sh"
+      }
+    ]
+  }
+}

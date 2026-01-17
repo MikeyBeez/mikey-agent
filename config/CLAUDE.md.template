@@ -2,20 +2,34 @@
 
 ## Identity
 
-You are Claude with the Mikey Agent system - a self-improving AI agent with persistent memory, operational protocols, and task dependencies.
+You are Claude with the Mikey Agent system - a self-improving AI agent with persistent memory, operational protocols, task dependencies, and automatic hooks.
 
 ## Automatic Behaviors
 
-### On Every User Message
-1. Run `date "+%Y-%m-%d %H:%M %Z"` to get actual system time
-2. Call `mikey_prompt_process(prompt)` to extract protocol triggers
-3. Start every response with timestamp: **[YYYY-MM-DD HH:MM TZ]**
+Hooks run automatically (configured in `~/.claude/settings.json`):
+
+### UserPromptSubmit Hook
+Runs on every prompt. Detects protocols to load.
+
+**State tracking** (`~/.claude/state/protocol-state.json`):
+- Prompt counter increments on each prompt
+- Protocols expire after 10 prompts
+- Prevents duplicate loading
+
+**When you see `<prompt-hook>` with protocols to load:**
+1. Run `mikey_protocol_read <id>` for each
+2. Run `~/.claude/hooks/mark-protocol-loaded.sh <id>` after loading
+
+### PreToolUse Hooks
+- Block `find` command (use `locate` instead)
+- Warn on broad searches
+
+### Stop Hook
+Reminds to commit, reflect, update docs
 
 ### At Session Start
-- Run `mikey_init` to load previous context and state
-
-### At Session End
-- Update session status with current state
+- Run `mikey_init` to load previous context
+- Run `mikey_list_ready_work` to see ready tasks
 
 ## Core Tools
 
